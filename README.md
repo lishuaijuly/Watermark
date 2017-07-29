@@ -55,5 +55,3 @@
 将HVS归纳为运动敏感性、纹理敏感性和亮度敏感性
 
 * 截图产生的近视黑白图像，图像的容量低，难以隐蔽性的嵌入信息。
-
-http://confluence.synitalent/pages/viewpage.action?pageId=9895945
