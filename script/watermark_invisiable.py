@@ -1,8 +1,4 @@
 #coding=utf-8
-'''
-    不可见水印的生成和提取。
-    PIL比opencv差多了。
-'''
 import sys
 import logging
 import time
@@ -13,114 +9,239 @@ import numpy as np
 
 import script.util as imutil
 
-logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.DEBUG)
+logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+
+class BlindWatermark():
+    def _gene_signature(self,wm,size,key):
+        '''提取特征，用来比对是否包含水印的，不用来恢复水印'''
+        wm = cv2.resize(wm,(size,size))        
+        wU,_,wV = np.linalg.svd(np.mat(wm))
+
+
+        sumU = np.sum(np.array(wU),axis=0)
+        sumV = np.sum(np.array(wV),axis=0)
+
+        sumU_mid = np.median(sumU)
+        sumV_mid = np.median(sumV)
+
+        sumU=np.array([1 if sumU[i] >sumU_mid else 0 for i in range(len(sumU)) ])
+        sumV=np.array([1 if sumV[i] >sumV_mid else 0 for i in range(len(sumV)) ])
+
+        uv_xor=np.logical_xor(sumU,sumV)
+
+        np.random.seed(key)
+        seq=np.random.randint(2,size=len(uv_xor))
+
+        signature = np.logical_xor(uv_xor, seq)
+
+        sqrts = int(np.sqrt(size))
+        return np.array(signature,dtype=np.int8).reshape((sqrts,sqrts))
+
+    def embed(self,ori_img, wm, key=10):
+        #ori_img = cv2.cvtColor(np.float32(ori_img), cv2.COLOR_BGR2YUV)
+
+        if len(ori_img.shape)==3:
+            img  = ori_img[:,:,0] 
+        else:
+            img  = ori_img  
+
+        size =(min( img.shape[:2]) //4) *4
+
+
+        LL,(HL,LH,HH) = pywt.dwt2(np.array(img[:size,:size]),'haar')  #512*512
+        LL_1,(HL_1,LH_1,HH_1) = pywt.dwt2(LL,'haar')    #256
+        LL_2,(HL_2,LH_2,HH_2) = pywt.dwt2(LL_1,'haar')  #128 
+        print(LL_1.shape,HL_1.shape,LH_1.shape,HH_1.shape)
+        embed = HH_1
+
+        #生成和嵌入特征        
+        signature = self._gene_signature(wm,64,key) #返回8×8的矩阵
+        w,h = embed.shape[:2]
+        if w < 32 or h < 32:
+            logging.warn("输入图片大小是 : {} × {} ，小于 32×32 ，不能嵌入,原图返回。".format(w ,h))
+            return ori_img
+
+        Q = 10
+        for i in range(0,w-4,4):
+            for j in range(0,h-4,4):
+                v = cv2.dct(np.float32(embed[i:i+4,j:j+4]))
+                v[2,2] = Q * signature[i%8,j%8]
+
+                maxium = max(v.flatten())
+                minium = min(v.flatten())
+                if maxium > 255:
+                    v = v - (maxium - 255)
+                if minium < 0:
+                    v = v - minium
+            
+                embed[i:i+4,j:j+4] = cv2.idct(v)
+
+
+        HH_1= embed
+        print(LL_1.shape,HL_1.shape,LH_1.shape,HH_1.shape)
+        #LL_1 = pywt.idwt2((LL_2,(HL_2,LH_2,HH_2)),'haar')
+        LL   = pywt.idwt2((LL_1,(HL_1,LH_1,HH_1)),'haar')
+
+        print(LL.shape,HL.shape,LH.shape,HH.shape)
+        img[:size,:size]  = pywt.idwt2((LL,(HL, LH,HH)), 'haar')
+        
+        if len(ori_img.shape)==3:
+            ori_img[:,:,0] =   img
+        else:
+            ori_img   = img
+
+        #ori_img = cv2.cvtColor(ori_img, cv2.COLOR_YUV2BGR)
+        return ori_img
+
+
+    def extract(self,ori_wmimage,wm,key=10):
+        #如果是rgb图像，使用红色分量
+        #ori_wmimage = cv2.cvtColor(np.float32(ori_wmimage), cv2.COLOR_BGR2YUV)
+
+        if len(ori_wmimage.shape)==3:
+            wmimage = ori_wmimage[:,:,0]
+        else:
+            wmimage = ori_wmimage
+       
+        size = min(wmimage.shape[:2])
+        
+        LL,(HL,LH,HH) = pywt.dwt2(np.array(wmimage[:size,:size]),'haar')  #512*512
+        LL_1,(HL_1,LH_1,HH_1) = pywt.dwt2(LL,'haar')    #256
+        LL_2,(HL_2,LH_2,HH_2) = pywt.dwt2(LL_1,'haar')  #128 
+        embed = HH_1
+        w,h = embed.shape[:2]
+
+        signature = self._gene_signature(wm,64,key) 
+
+        ext_sig=np.zeros((w-4,h-4),dtype=np.int)
+        Q = 10
+        for i in range(w-4):
+            for j in range(h-4):
+                dct= cv2.dct(np.float32(embed[i:i+4,j:j+4]))
+                if dct[2,2] > Q/2:
+                    ext_sig[i,j] = 1
+        max_sim = 0
+        for i in range(w-12):
+            for j in range(h-12):
+                sim = np.sum(np.equal(signature,ext_sig[i:i+8,j:j+8]))/64
+                if sim >max_sim:
+                    max_sim =sim
+                if max_sim > 0.9:
+                    return max_sim
+
+        return max_sim
+
 
 class LsbWatermark:
-    @staticmethod
-    def decompose(data): # bytes转化为普通数组
-        v = []
-        fsize = (len(data)+4) * 8 
-        bs = imutil.intToBytes(fsize)
-        bs += [b for b in data]
 
-        for b in bs:
-            for i in range(7, -1, -1):
-                v.append((b >> i) & 0x1)
+    def _gene_signature(self,wm,key):
+        '''提取特征，用来比对是否包含水印的，不用来恢复水印'''
+        wm = cv2.resize(wm,(256,256))        
+        wU,_,wV = np.linalg.svd(np.mat(wm))
 
-        return v     # 4 + 8*len
 
-    @staticmethod
-    def assemble(v):    #普通数组转化为bytes
-        bs = []
-        length = len(v)
-        for idx in range(0, int(len(v)/8)):
-            byte = 0
-            for i in range(0, 8):
-                if (idx*8+i < length):
-                    byte = (byte<<1) + v[idx*8+i]  
-                           
-            bs .append(byte)
+        sumU = np.sum(np.array(wU),axis=0)
+        sumV = np.sum(np.array(wV),axis=0)
 
-        #invalidsize = (len(bs) -4) % 8
-        return bytes(bs[4:])
+        sumU_mid = np.median(sumU)
+        sumV_mid = np.median(sumV)
+
+        sumU=np.array([1 if sumU[i] >sumU_mid else 0 for i in range(len(sumU)) ])
+        sumV=np.array([1 if sumV[i] >sumV_mid else 0 for i in range(len(sumV)) ])
+
+        uv_xor=np.logical_xor(sumU,sumV)
+
+        np.random.seed(key)
+        seq=np.random.randint(2,size=len(uv_xor))
+
+        signature = np.logical_xor(uv_xor, seq)
+        return np.array(signature,dtype=np.int8)
+
+    def embed(self,ori_img, wm, key=None):
+        if len(ori_img.shape)==3:
+            img  = ori_img[:,:,0] 
+        else:
+            img  = ori_img    
+      
+        #生成和嵌入特征        
+        signature = self._gene_signature(wm,key).reshape((16,16))  
+
+        w,h = img.shape[:2]
+        if w < 16 or h < 16:
+            logging.warn("输入图片大小是 : {} × {} ，小于 16×16 ，不能嵌入,原图返回。".format(w ,h))
+            return ori_img
+
+        #将图片分片，全部嵌入，值嵌入一个通道
+        for i in range(0,w,16):
+            for j in range(0,h,16):
+                for ii in range(16):
+                    for jj in range(16):
+                        #print(ii,jj,img[ii,jj])
+                        img[ii,jj] = imutil.set_bit(img[ii,jj],4,signature[ii][jj])
+                        img[ii,jj] = imutil.set_bit(img[ii,jj],3,1)
+                        img[ii,jj] = imutil.set_bit(img[ii,jj],2,1)
+                        #print(ii,jj,img[ii,jj])
+                        
         
-    @staticmethod        
-    def calc_wmsize(v):
-        bs = []
-        for idx in range(0, int(len(v)/8)):
-            byte = 0
-            for i in range(0, 8):
-                byte = (byte<<1) + v[idx*8+i]    
-            bs.append(byte)
+        print(img[:16,:16])
+        if len(ori_img.shape)==3:
+            ori_img[:,:,0] =   img
+        else:
+            ori_img   = img
 
-        fsize = imutil.bytesToInt(bs)
-        return fsize
-
-    def embed(self,img, wmdata, key=None,max_wm_size=2*1024+4):
-        '''
-            使用LSB的方式生成不可见水印
-            img ：原图 ，Image
-            wm : 任意bytes数据
-        '''
-        img_shape= img.shape
-        logging.info("输入文件大小 : %dx%d pixels." % (img_shape[0] ,img_shape[1]))
+        return ori_img
         
-        max_size =min(max_wm_size,img_shape[0] * img_shape[1]*3.0/8)
-        logging.info("最大可保存水印信息量 : %.2f Bit." % (max_size))
+    def ext_sig(self,img,size=16):
+        w,h = img.shape[:2]
+        ext_sig=[]
+        print(img[:16,:16])
+        for m in range(1): #,w-size):
+            for n in range(1): #,h-size):
+                one_sig=np.ones((size,size))
+                for i in range(m,w,size):
+                    for j in range(n,h,size):
+                        for ii in range(size):
+                            for jj in range(size):
+                                one_sig[ii][jj] = imutil.get_bit(img[ii,jj],4)
+                        ext_sig.append(one_sig)
+        return ext_sig
 
-        if key !=None:
-            cipher = imutil.AESCipher(key)
-            wmdata = cipher.encrypt(wmdata) #对数据做加密
- 
-        v = self.decompose(wmdata) #转化为0-1
-        payload_size = len(v)/8
-        logging.info("要保存的信息量 : %.3f Bit " % (payload_size))
-        if (payload_size > max_size - 4):
-            logging.fatal("数据太大，不能作为水印。")
-            return None
-            
-        #LSB填充并输出
-        idx = 0
-        img = img.flatten()
-        for i in range(len(v)):
-            img[i]  = imutil.set_bit(img[i], 0, v[i])
 
-        img = img.reshape(img_shape)
-        return img
-        
-    def extract(self,wmd_img, key=None,max_wm_size=2*1024+4):
+    def extract(self,ori_wmimage,wm, key=None):
         '''
             提取LSB信息
         '''
-        wd_shape = wmd_img.shape
+        #如果是rgb图像，使用红色分量
+        if len(ori_wmimage.shape)==3:
+            wmimage = ori_wmimage[:,:,0]
+        else:
+            wmimage = ori_wmimage
+
+        #生成和嵌入特征        
+        signature = self._gene_signature(wm,key).reshape((16,16))  
+
+        #提取嵌入的信息
+        ext_sigs = self.ext_sig(wmimage,size=16)
+        #ext_sigs.extend(self.ext_sig(np.rot90(wmimage,1)))
+        #ext_sigs.extend(self.ext_sig(np.rot90(wmimage,2)))
+        #ext_sigs.extend(self.ext_sig(np.rot90(wmimage,3)))
+
+          #计算相似度
+        similarity = 0 
+        for sig in ext_sigs:
+            print(sig)
+            print(signature)
+            one_similarity = list(np.array(sig.flatten()) - signature.flatten()).count(0) / len(signature.flatten())
+            #logging.info('一个相似度 : {}'.format(one_similarity))
+            similarity = max(similarity,one_similarity )
+            break
         
-        wmd_img =wmd_img.flatten()
-        max_size = max_wm_size
-        
-        #提取信息
-        v = []
-        for i in range(max_size):
-            if len(v) > max_size:
-                break
-            
-            v.append(wmd_img[i] & 1)
-            if i==31:
-                fsize=self.calc_wmsize(v)  #先提取头部的长度信息
-                max_size=min(max_wm_size,fsize)
+        logging.debug('提取的信息和水印信息相似度是：%f (1最大，0最小，建议参考值是0.7)'  % (similarity))
 
-        data_out = self.assemble(v)
-        if key !=None:
-            cipher = imutil.AESCipher(key)
-            data_out = cipher.decrypt(data_out)  #解密
-
-        return data_out
-
-    
+        return similarity
 
 class DwtsvdWatermark:
-    '''
-        盲水印，DWT+SVD
-    '''      
+    ''' 盲水印，DWT+SVD '''      
 
     def _gene_signature(self,wU,wV,key):
         '''提取特征，用来比对是否包含水印的，不用来恢复水印'''
@@ -139,17 +260,51 @@ class DwtsvdWatermark:
         seq=np.random.randint(2,size=len(uv_xor))
 
         signature = np.logical_xor(uv_xor, seq)
-        return np.array(list(signature),dtype=np.float)
+        return np.array(signature,dtype=np.int8)
 
-    def _gene_embed_space(self,LL_4,HH_4):
-        LL_4 = LL_4.reshape([1,-1])
-        HH_4 = HH_4.reshape([1,-1])
-        combo_LL4_HH4 = np.append(LL_4,HH_4)
-        combo_neg_idx = [1 if combo_LL4_HH4[i]<0  else 0 for i in range(len(combo_LL4_HH4))]
+    def _embed_svd_sig(self,vec,signature):
+        #特征是128位的，
+        #vec 是128×128 ， 分成8×8的小图像，一共，256个
+        #在vec的特征值里嵌入信息
+        print(vec[:3,:3])
+        Q= 32
+        idx = 0 
+        mask = np.random.random(size=64).reshape((8,8)) 
+        for i in range(0,vec.shape[0],8):  #128*128
+            for j in range(0,vec.shape[1],8):
+                onepiece = vec[i:i+8,j:j+8]  #+ mask #遇到纯色的区域时，可以避免嵌入不了信息
+                u,s,v = np.linalg.svd(np.mat(onepiece))
+                eigen = s[0] + Q
+                if idx +1 >=len(signature):
+                    break
+                eid = signature[idx]
+                idx =idx +1
+                z= eigen % Q
+                t=eigen
+                if  eid==1 and z < Q/4:
+                    eigen =eigen -z - (Q/4)
+                elif  eid==1 and z >= Q/4:
+                    eigen = eigen -z + 3*(Q/4)
+                elif  eid==0 and z < 3* (Q/4):
+                    eigen = eigen -z + (Q/4)
+                elif  eid==0 and z >= 3*(Q/4):
+                    eigen = eigen -z + 5* (Q/4)
+                s[0] = eigen
+                print(eigen-t,t,eigen)
+                vec[i:i+8,j:j+8] = u * np.diag(s) * v
+        print(vec[:3,:3])
+        return vec
 
-        combo_LL4_HH4_pos = np.abs(combo_LL4_HH4)
-        int_part = np.floor(combo_LL4_HH4_pos)
-        frac_part = np.round(combo_LL4_HH4_pos - int_part,2)
+
+
+    def _gene_embed_space(self,vec):
+        shape = vec.shape
+        vec = vec.flatten()
+        combo_neg_idx = np.array([1 if vec[i]<0  else 0 for i in range(len(vec))])
+
+        vec_pos = np.abs(vec)
+        int_part = np.floor(vec_pos)
+        frac_part = np.round(vec_pos - int_part,2)
         
         bi_int_part=[] #数据转化为二维的，然后使用signature替换其中一位。
         for i in range(len(int_part)):
@@ -159,17 +314,35 @@ class DwtsvdWatermark:
             bi_int_part.append(np.array(bie,dtype=np.uint16))
         bi_int_part = np.array(bi_int_part)
 
-        return np.array(bi_int_part),frac_part,combo_neg_idx
+        sig = []
+        for i in range(len(bi_int_part)):
+            sig.append(bi_int_part[i][10])
+        sig = np.array(sig).reshape(shape)
+        return np.array(bi_int_part),frac_part.reshape(shape),combo_neg_idx.reshape(shape),sig
 
-    def _embed_signature(self,LL,signature):
-        '''把特征嵌入到低频信号中'''
-        LL_1,(HL_1,LH_1,HH_1) = pywt.dwt2(np.array(LL,dtype=np.int32),'haar') 
-        LL_2,(HL_2,LH_2,HH_2) = pywt.dwt2(np.array(LL_1,dtype=np.int32),'haar') 
-       
-        bi_int_part,frac_part,combo_neg_idx = self._gene_embed_space(LL_2,HH_2)
 
-        for i in range(len(signature)):   #只替换了前256个
-            bi_int_part[i][10] = signature[i]
+    def _embed_sig(self,bi_int_part,frac_part,combo_neg_idx,signature):
+        shape = frac_part.shape
+
+        frac_part = frac_part.flatten()
+        combo_neg_idx = combo_neg_idx.flatten()
+        
+        m = len(signature)
+        n = len(bi_int_part)
+        logging.info('特征向量大小 ： {} ,嵌入空间大小： {}'.format(m,n))
+
+        if m >= n :
+            for i in range(n):
+                bi_int_part[i][10] =signature[i]
+
+        if m < n :  #全部嵌入
+            rate  = n//m
+            for i in range(m):
+                for j in range(rate):
+                    bi_int_part[i+j*m][10] =signature[i]
+            #for i in range(n-m*rate):
+            #    bi_int_part[i+rate*m][10] =signature[i]
+                
 
         #嵌入完成，组装回去
         em_int_part = []
@@ -178,68 +351,187 @@ class DwtsvdWatermark:
             s+= (''.join([str(j) for j in bi_int_part[i]]))
             em_int_part.append(eval(s))
         
-        em_int_part = np.array(em_int_part)
-        em_combo = em_int_part + frac_part
+        em_combo = np.array(em_int_part) + np.array(frac_part)
 
-        em_combo = np.array([-1*em_combo[i] if combo_neg_idx[i]==1 else em_combo[i] for i in range(len(em_combo))])
-        
-        em_LL_2 = em_combo[:4096].reshape((64,64))
-        em_HH_2 = em_combo[4096:].reshape((64,64))
-        em_LL_1 = pywt.idwt2((em_LL_2,(HL_2,LH_2,em_HH_2)),'haar')
-        em_LL   = pywt.idwt2((em_LL_1,(HL_1,LH_1,HH_1)),'haar')
+        return  np.array([-1*em_combo[i] if combo_neg_idx[i]==1 else em_combo[i] for i in range(len(em_combo))]).reshape(shape)
 
-        return em_LL
+    def _calc_var(self,nlist):
+        '''计算方差，更具HVS，方差大的嵌入信息更不可见'''
+        narray=np.array(nlist)
+        mean=narray.sum()/len(nlist) 
+        var = (narray*narray).sum()/len(nlist) - mean**2
+        #print(nlist,mean,var)
+        return var
+   
+    def _extract_sig(self,ext_sig,siglen):
+        ext_sig = list(ext_sig.flatten())
         
-    def embed(self, img,wm,key=10):
-        w,h = img.shape[:2]
-        img = cv2.resize(img,(512,512))
+        m = len(ext_sig)
+        n = siglen
+        ext_sigs=[]
+        
+        if n >= m :
+            ext_sigs.append(ext_sig.extend([0] * (n-m)))
+        
+        if n < m:
+            rate= m//n
+            for i  in range(rate):
+                ext_sigs.append( ext_sig[i*n:(i+1)*n])
+                
+        return ext_sigs
+
+    def _extract_svd_sig(self,vec,siglen):
+        Q = 32
+        ext_sig=[]
+      
+        for i in range(0,vec.shape[0],8):  #128*128
+            for j in range(0,vec.shape[1],8):
+                u,s,v = np.linalg.svd(np.mat(vec[i:i+8,j:j+8]))
+                z = s[0] % Q
+                if z>=Q/2 :
+                    ext_sig.append(1)                    
+                else:
+                    ext_sig.append(0)
+
+        if siglen >len(ext_sig):
+            logging.warning('extract svd sig is {},small  than needed {}'.format(len(ext_sig),siglen))
+            ext_sig.extend([0] * (siglen - len(ext_sig)))
+        else:
+            ext_sig = ext_sig[:siglen]
+
+        return [ext_sig]
+
+
+##################################################################################################################################
+    def embed(self, ori_img,wm,key=10):
+        '''默认水印是灰度图像传进来的，即数据格式是2维的'''
+        w,h = ori_img.shape[:2]
+        ori_img = cv2.resize(ori_img,(512,512))
+        wm = cv2.resize(wm,(64,64))
+        
+        ori_img = cv2.cvtColor(ori_img, cv2.COLOR_BGR2YUV)
+        #对于RGB图像使用红色通道的高频分量保存水印的特征值
+        if len(ori_img.shape)==3:
+            img  = ori_img[:,:,0] 
+        else:
+            img  = ori_img       
+
+        LL,(HL,LH,HH) = pywt.dwt2(np.array(img),'haar')  #512*512
+        LL_1,(HL_1,LH_1,HH_1) = pywt.dwt2(LL,'haar')    #256
+        LL_2,(HL_2,LH_2,HH_2) = pywt.dwt2(LL_1,'haar')  #128 
+        LL_3,(HL_3,LH_3,HH_3) = pywt.dwt2(LL_2,'haar')  #64
+        LL_4,(HL_4,LH_4,HH_4) = pywt.dwt2(LL_3,'haar')  #32
        
-        LL,(HL,LH,HH) = pywt.dwt2(np.array(img),'haar') #使用红色通道的高频分量保存水印的特征值
+        #高频的特征值水印，对图像变化不敏感。用来恢复水印使用
         iU,iS,iV = np.linalg.svd(np.mat(HH))
-
-        wm = cv2.resize(wm,(512,512))  #水印图像转成 灰度图像
         wU,wS,wV = np.linalg.svd(np.mat(wm))
-        
-        em_HH     = iU * np.diag(wS[:256]) *iV  #高频的特征值水印，对图像变化不敏感。用来恢复水印使用@
+        '''
+        if len(iS) <= len(wS):
+            HH = iU * np.diag(wS[:len(iS)]) *iV 
+        else:
+            newIs = list(wS)
+            newIs.extend([0] * (len(iS)-len(wS)))
+            HH = iU * np.diag(newIs) *iV 
+        '''
+        #生成和嵌入特征
+        signature = self._gene_signature(np.array(wU),np.array(wV),key)   
 
-        signature = self._gene_signature(np.array(wU),np.array(wV),key)
-        em_LL     = self._embed_signature(LL, signature)
+        #直接嵌入到高频域中
+        print('-----> 1 ',HH_2[:5:5])
+        bi_int_part,frac_part,combo_neg_idx,_ = self._gene_embed_space(HH_2)
+        HH_2 = self._embed_sig(bi_int_part,frac_part,combo_neg_idx,signature)
+        print('-----> 2 ',HH_2[:5:5])
+        #嵌入到特征值中
+        #LL_2 = self._embed_svd_sig(LL_2,signature)
        
-        img = pywt.idwt2((em_LL,(HL, LH,em_HH)), 'haar')  
+        LL_3 = pywt.idwt2((LL_4,(HL_4,LH_4,HH_4)),'haar')
+        LL_2 = pywt.idwt2((LL_3,(HL_3,LH_3,HH_3)),'haar')   
+        LL_1 = pywt.idwt2((LL_2,(HL_2,LH_2,HH_2)),'haar')
+        LL   = pywt.idwt2((LL_1,(HL_1,LH_1,HH_1)),'haar')
+        img  = pywt.idwt2((LL,(HL, LH,HH)), 'haar')
+        
+        ####################
+        img =np.round(img)
+        print('===> 1',img[:5,:5])
+        ori_img[:,:,0] = img
+        print('===> 2',ori_img[:5,:5,0])
+        
+        LL,(HL,LH,HH) = pywt.dwt2(np.array(ori_img[:,:,0]),'haar')  #512*512
+        LL_1,(HL_1,LH_1,HH_1) = pywt.dwt2(LL,'haar')    #256
+        LL_2,(HL_2,LH_2,HH_2) = pywt.dwt2(LL_1,'haar')  #128 
+        LL_3,(HL_3,LH_3,HH_3) = pywt.dwt2(LL_2,'haar')  #64
+        LL_4,(HL_4,LH_4,HH_4) = pywt.dwt2(LL_3,'haar')  #32
 
-        return cv2.resize(img,(h,w))
+        print('-----> 4 ',HH_4[:5:5])
+        ###################
 
 
-    def extract(self,wmimage,wm,key=10):
+        #恢复图像
+        if len(ori_img.shape)==3:
+            ori_img[:,:,0] =   img
+        else:
+            ori_img   = img
+
+        ori_img = cv2.cvtColor(ori_img, cv2.COLOR_YUV2BGR)
+        
+        return cv2.resize(ori_img,(h,w)) 
+
+    
+    def extract(self,ori_wmimage,wm,key=10):
         ''' 检测是否包含水印，如果包含的话输出水印'''
-        wmimage = cv2.resize(wmimage,(512,512))
-       
-        LL,(HL,LH,HH) = pywt.dwt2(wmimage,'haar') 
         
+        ori_wmimage = cv2.resize(ori_wmimage,(512,512))
+        ori_wmimage = cv2.cvtColor(ori_wmimage, cv2.COLOR_BGR2YUV)
+        
+        w,h = wm.shape[:2]
+        wm = cv2.resize(wm,(64,64))
+        
+        #如果是rgb图像，使用红色分量
+        if len(ori_wmimage.shape)==3:
+            wmimage = ori_wmimage[:,:,0]
+        else:
+            wmimage = ori_wmimage
+
+        LL,(HL,LH,HH) = pywt.dwt2(wmimage,'haar') 
         LL_1,(HL_1,LH_1,HH_1) = pywt.dwt2(LL,'haar') 
         LL_2,(HL_2,LH_2,HH_2) = pywt.dwt2(LL_1,'haar') 
+        LL_3,(HL_3,LH_3,HH_3) = pywt.dwt2(LL_2,'haar')
+        LL_4,(HL_4,LH_4,HH_4) = pywt.dwt2(LL_3,'haar')
+        iU,iS,iV = np.linalg.svd(np.mat(HH))
 
-        ori_w_shape = wm.shape
-        wm = cv2.resize(wm,(512,512)) #水印图像转成 灰度图像
+        #合成图像返回 (意义不大，接口不需要的时候可以去掉)
         wU,wS,wV = np.linalg.svd(np.mat(wm))
+        if len(wS) <= len(iS):
+            wS = iS[:len(wS)]
+        else:
+            wS = list(iS)
+            wS.extend([0] * (len(wS) - len(iS)))
+        em_rec_data = wU * np.diag(np.array(wS)) * wV
+        
 
+        #计算原始特征作对比
         signature = self._gene_signature (np.array(wU), np.array(wV), key)
 
-        ext_signature = []
-        bi_int_part,frac_part,_ = self._gene_embed_space(LL_2,HH_2)
+        _,_,_,ori_sig = self._gene_embed_space(HH_2)
+        #print('-----> 3 ',HH_4[:5:5])
 
-        for i in range(len(signature)):   #替换
-            ext_signature.append(bi_int_part[i][10] )
+        ext_sigs=[]
+        ext_sigs.extend(self._extract_sig(ori_sig,len(signature)))
+        ext_sigs.extend(self._extract_sig(np.rot90(ori_sig,1),len(signature)))
+        ext_sigs.extend(self._extract_sig(np.rot90(ori_sig,2),len(signature)))
+        ext_sigs.extend(self._extract_sig(np.rot90(ori_sig,3),len(signature)))
+        
+        #ext_sigs.extend(self._extract_svd_sig(LH_2,len(signature)))
 
-        signature = signature / np.sqrt(np.sum(signature*signature))
-        ext_signature = np.array(ext_signature,dtype=np.uint16)
-        ext_signature = ext_signature / np.sqrt(np.sum(ext_signature*ext_signature))
-        corecoef = np.sum(signature*ext_signature)
+        #计算相似度
+        similarity = 0 
+        for sig in ext_sigs:
+            #print(sig)
+            #print(list(signature))
+            one_similarity = list(np.array(sig) - signature).count(0) / len(signature)
+            #logging.info('一个相似度 : {}'.format(one_similarity))
+            similarity = max(similarity,one_similarity )
+        
+        logging.debug('提取的信息和水印信息相似度是：%f (1最大，0最小，建议参考值是0.7)'  % (similarity))
 
-        logging.info('提取的信息和水印信息相似度是：%f (1最大，0最小，建议参考值是0.7)'  % (corecoef))
-        iU,iS,iV = np.linalg.svd(np.mat(HH))
-        uS = list(iS)
-        uS.extend(list(wS)[256:])
-        em_rec_data = wU * np.diag(np.array(uS)) * wV
-
-        return  cv2.resize(em_rec_data,ori_w_shape)*255,corecoef
+        return  cv2.resize(em_rec_data,(h,w)),similarity

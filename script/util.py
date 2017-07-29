@@ -40,6 +40,13 @@ def set_bit(n, i, x):
         n |= mask
     return n
 
+def get_bit(n, i):
+    '''
+        获取n的第i位
+    '''
+    t = n>>i    
+    return bin(t)[-1]
+
 def intToBytes(value):
     bs = []  
     bs.append (value & 0x000000FF)        
@@ -50,3 +57,23 @@ def intToBytes(value):
 
 def bytesToInt (bs,offset=0 ):
     return   (bs[offset]&0xFF)| ((bs[offset+1]<<8) & 0xFF00)  | ((bs[offset+2]<<16)& 0xFF0000)   | ((bs[offset+3]<<24) & 0xFF000000)
+
+def gen_signature(wm,key):
+        '''提取特征，用来比对是否包含水印的，不用来恢复水印'''
+        wU,wS,wV = np.linalg.svd(np.mat(wm))
+        sumU = np.sum(wU,axis=0)
+        sumV = np.sum(wV,axis=0)
+
+        sumU_mid = np.median(sumU)
+        sumV_mid = np.median(sumV)
+
+        sumU=np.array([1 if sumU[i] >sumU_mid else 0 for i in range(len(sumU)) ])
+        sumV=np.array([1 if sumV[i] >sumV_mid else 0 for i in range(len(sumV)) ])
+
+        uv_xor=np.logical_xor(sumU,sumV)
+
+        np.random.seed(key)
+        seq=np.random.randint(2,size=len(uv_xor))
+
+        signature = np.logical_xor(uv_xor, seq)
+        return np.array(signature)

@@ -73,11 +73,15 @@ class VisWatermark:
         else: 
             posw,posh = position
             #wmim = cv2.resize(wmim,(ih-posh,iw - posw))
+            resize_flag=False
             if ww > iw - posw:
                 ww = iw - posw
+                resize_flag = True
             if wh > ih - posh:
+                resize_flag = True
                 wh = ih - posh
-            wmim = cv2.resize(wmim,(wh,ww))
+            if resize_flag :
+                wmim = cv2.resize(wmim,(wh,ww))
             im[posw:posw+ww,posh:posh+wh,:] = im[posw:posw+ww,posh:posh+wh,:] * (1-transp) + wmim*transp
 
 
