@@ -81,13 +81,13 @@ def attack(fname,type):
         return img
 
 
-    if type == "vwm":
-        vwm = script.VisWatermark 
-        mark =  cv2.imread('./data/wm.png')  
-        params = {}
-        params['position']      = (30,30)
-        img =vwm.watermark_image(img, mark, params)
-        return img
+    # if type == "vwm":
+    #     vwm = script.VisWatermark 
+    #     mark =  cv2.imread('./data/wm.png')  
+    #     params = {}
+    #     params['position']      = (30,30)
+    #     img =vwm.watermark_image(img, mark, params)
+    #     return img
 
     
     if type == "randline":  
